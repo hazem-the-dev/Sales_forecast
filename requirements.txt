@@ -6,5 +6,5 @@ pandas
 requests
 scikit-learn
 tensorflow
-dotenv
-typing
+python-dotenv
+ 
