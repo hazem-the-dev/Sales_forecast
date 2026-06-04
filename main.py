@@ -10,6 +10,7 @@ import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from typing import List
 
 # ML / DL Imports (Tuning libraries removed)
 from sklearn.ensemble import GradientBoostingRegressor
@@ -37,11 +38,6 @@ app.add_middleware(
 class SalesItem(BaseModel):
     order_date: str = Field(..., description="Date format: YYYY-MM-DD or ISO string")
     revenue: float = Field(..., description="Revenue amount generated")
-
-class ForecastRequest(BaseModel):
-    business_id: str = "My Store"
-    force_refresh: bool = True
-    sales_data: List[SalesItem]
 
 # ─── CORE ML PIPELINE FUNCTIONS ──────────────────────────────────────────────
 
@@ -172,8 +168,9 @@ def _call_llm_for_risks(context: dict) -> list[str]:
 # ─── API ENDPOINT ROUTE ──────────────────────────────────────────────────────
 
 @app.post("/api/v1/forecast-recommendations")
-async def generate_recommendations(payload: ForecastRequest):
-    incoming_data = [item.dict() for item in payload.sales_data]
+async def generate_recommendations(payload: List[SalesItem]):
+    # Since payload is now directly the list, we iterate over it directly
+    incoming_data = [item.dict() for item in payload]
     df = pd.DataFrame(incoming_data)
     
     if df.empty or 'order_date' not in df.columns or 'revenue' not in df.columns:
