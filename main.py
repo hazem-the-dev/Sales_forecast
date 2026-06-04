@@ -4,6 +4,7 @@ import json
 import warnings
 from datetime import datetime, timedelta
 from typing import List
+from dotenv import load_dotenv
 
 import numpy as np
 import pandas as pd
@@ -142,8 +143,8 @@ def generate_future_forecast(raw_sales, feature_cols, scaler_x, scaler_y, lstm_m
     return future_predictions
 
 # ─── LLM CLIENT FUNCTION ─────────────────────────────────────────────────────
-
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+load_dotenv()
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 PROMPT_RISK_FACTORS = """You are a senior revenue analyst looking at business operational sales trends. Based on the JSON payload regarding future trajectory shifts, return a list of contextual risk factors (such as operational, competitors or external). 
 Return ONLY a valid JSON array of strings. No conversational text outside the JSON block.
 Output format:
