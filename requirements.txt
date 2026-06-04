@@ -7,4 +7,3 @@ requests
 scikit-learn
 python-dotenv
 asyncio
-warnings
