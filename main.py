@@ -5,7 +5,6 @@ import warnings
 from datetime import datetime, timedelta
 from typing import List
 from dotenv import load_dotenv
-
 import numpy as np
 import pandas as pd
 import requests
