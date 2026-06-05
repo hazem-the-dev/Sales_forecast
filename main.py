@@ -27,7 +27,11 @@ from sklearn.preprocessing import RobustScaler
 from sqlalchemy import create_engine, text
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
+import logging
+import traceback
 
+
+logging.basicConfig(level=logging.DEBUG)
 warnings.filterwarnings("ignore")
 
 # ─── DETERMINISM ──────────────────────────────────────────────────────────────
@@ -361,18 +365,18 @@ def load_data_from_db(business_id: str) -> List[Dict[str, Any]]:
 
     query = text("""
         SELECT 
-            o."createdAt" as order_date, 
-            oi."productId" as product_id, 
-            p."name" as product_name, 
-            oi."unitPrice" as unit_price, 
-            oi."quantity" as quantity, 
-            oi."itemDiscount" as item_discount, 
-            p."cost" as cost
+            o.created_at as order_date,
+            oi.product_id,
+            p.name as product_name,
+            oi.unit_price,
+            oi.quantity,
+            oi.item_discount,
+            p.cost
         FROM "order" o
-        INNER JOIN "orderItem" oi ON o.id = oi."orderId"
-        INNER JOIN "product" p ON p.id = oi."productId"
-        WHERE o."businessId" = :biz_id 
-          AND o."status" NOT IN ('cancelled', 'refunded')
+        INNER JOIN order_item oi ON o.id = oi.order_id
+        INNER JOIN product p ON p.id = oi.product_id
+        WHERE o.business_id = :biz_id
+        AND o.status NOT IN ('cancelled', 'refunded')
     """)
 
     with db_engine.connect() as conn:
@@ -538,36 +542,48 @@ async def chat_with_fuse(req: ChatRequest):
     try:
         state = await init_fuse(req.businessId)
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database fetch failed: {str(e)}")
 
     retrieved_docs = query_chunks(req.message, state.chunks, top_k=12)
     
     yearly_anchor_parts = []
-    for r in state.yearly_stats:
-        growth_str = f"{r['growth']:+.1f}%" if r['growth'] is not None else "N/A"
+
+    for r in state.yearly_stats or []:
+        growth = r.get("growth")
+        revenue = r.get("revenue", 0)
+        profit = r.get("profit", 0)
+        margin = r.get("margin")
+
+        growth_str = f"{growth:+.1f}%" if isinstance(growth, (int, float)) else "N/A"
+        margin_str = f"{margin:.1%}" if isinstance(margin, (int, float)) else "N/A"
+
         yearly_anchor_parts.append(
-            f"Year {r['year']}: Revenue={r['revenue']:,.0f} EGP, Profit={r['profit']:,.0f} EGP, "
-            f"Margin={r['margin']:.1%}, YoY Growth={growth_str}"
+            f"Year {r.get('year', 'N/A')}: "
+            f"Revenue={revenue:,.0f} EGP, "
+            f"Profit={profit:,.0f} EGP, "
+            f"Margin={margin_str}, "
+            f"YoY Growth={growth_str}"
         )
     context = f"[Yearly Anchors]\n{chr(10).join(yearly_anchor_parts)}\n\n[Retrieved Context]\n{chr(10).join(retrieved_docs)}"
 
     system_prompt = f"""
-You are FUSE AI — a senior business advisor embedded inside this company.
-You have an MBA-level grasp of strategy, finance, pricing, operations, and growth.
+        You are FUSE AI — a senior business advisor embedded inside this company.
+        You have an MBA-level grasp of strategy, finance, pricing, operations, and growth.
 
-════════════════════════════════════════════════
-BUSINESS INTELLIGENCE
-════════════════════════════════════════════════
-{state.data_summary}
-════════════════════════════════════════════════
+        ════════════════════════════════════════════════
+        BUSINESS INTELLIGENCE
+        ════════════════════════════════════════════════
+        {state.data_summary}
+        ════════════════════════════════════════════════
 
-━━━ THE CONSULTANT STANDARD ━━━
-1. ANCHOR IN DATA FIRST. Open with the most relevant hard number.
-2. DIAGNOSE WHAT THE DATA IS TELLING YOU. 
-3. APPLY BUSINESS EXPERTISE. Layer in the "so what".
-4. FOR FUTURE QUESTIONS: Extrapolate from the trend.
-5. CLOSE WITH ONE SHARP ACTION.
-"""
+        ━━━ THE CONSULTANT STANDARD ━━━
+        1. ANCHOR IN DATA FIRST. Open with the most relevant hard number.
+        2. DIAGNOSE WHAT THE DATA IS TELLING YOU. 
+        3. APPLY BUSINESS EXPERTISE. Layer in the "so what".
+        4. FOR FUTURE QUESTIONS: Extrapolate from the trend.
+        5. CLOSE WITH ONE SHARP ACTION.
+        """
 
     formatted_history = [{"role": m.role, "content": m.content} for m in req.history]
     messages = [
@@ -589,6 +605,7 @@ BUSINESS INTELLIGENCE
         return {"reply": reply}
 
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {str(e)}")
 
 @app.post("/api/v1/cache/clear")
