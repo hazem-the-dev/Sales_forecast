@@ -7,3 +7,10 @@ requests
 scikit-learn
 python-dotenv
 asyncio
+joblib
+chromadb
+sentence-transformers
+openai
+openpyxl
+sqlalchemy
+psycopg2-binary

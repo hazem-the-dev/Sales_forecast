@@ -5,7 +5,8 @@ import random
 import asyncio
 import warnings
 from datetime import timedelta
-from typing import List
+from typing import List, Dict, Any
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -22,6 +23,11 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import RobustScaler
 
+# ─── NEW IMPORTS FOR CHAT ROUTE ───────────────────────────────────────────────
+from sqlalchemy import create_engine, text
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+
 warnings.filterwarnings("ignore")
 
 # ─── DETERMINISM ──────────────────────────────────────────────────────────────
@@ -35,8 +41,9 @@ os.environ["PYTHONHASHSEED"] = str(SEED)
 
 load_dotenv()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "") # Added for Chat DB connection
 
-app = FastAPI(title="Sales Forecasting API")
+app = FastAPI(title="Sales Forecasting & FUSE Chat API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://fuse-eg.vercel.app"],
@@ -46,6 +53,10 @@ app.add_middleware(
 )
 
 executor = ThreadPoolExecutor(max_workers=4)
+
+# ==============================================================================
+# 1. YOUR EXACT ORIGINAL FORECASTING PIPELINE & ROUTE
+# ==============================================================================
 
 # ─── SCHEMA ───────────────────────────────────────────────────────────────────
 
@@ -93,15 +104,6 @@ def make_dataset(rev: np.ndarray, feats: np.ndarray):
     return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
 
 # ─── PIPELINE ────────────────────────────────────────────────────────────────
-# Uses a two-horizon strategy:
-#   Model A → predicts days 1-30  (short, high accuracy)
-#   Model B → predicts days 1-90  (full horizon)
-# Blended on test set per-horizon.
-# HistGradientBoosting is chosen because:
-#   - Native multi-output support (no wrapper → 1 model not 90)
-#   - Handles missing values internally
-#   - 5-10x faster than GBR
-#   - Memory-efficient histogram binning
 
 def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
     feat_cols = [c for c in daily_df.columns if c != "revenue"]
@@ -118,7 +120,6 @@ def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
     X_tr, X_te = X[:split], X[split:]
     Y_tr, Y_te = Y[:split], Y[split:]
 
-    # ── Shared model factory ────────────────────────────────────────────────
     def _fit(X, y, max_iter, max_depth, min_leaf, l2):
         m = HistGradientBoostingRegressor(
             max_iter=max_iter, max_depth=max_depth, learning_rate=0.1,
@@ -129,7 +130,6 @@ def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
         m.fit(X, y)
         return m
 
-    # ── Model A: 30-day — all days trained in parallel ──────────────────────
     progress_cb(15, "Training 30-day models (parallel)")
     models_30 = Parallel(n_jobs=-1, prefer="threads")(
         delayed(_fit)(X_tr, Y_tr[:, d], 200, 5, 8, 0.1)
@@ -137,7 +137,6 @@ def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
     )
     progress_cb(48, "30-day models complete")
 
-    # ── Model B: 90-day — all days trained in parallel ──────────────────────
     progress_cb(50, "Training 90-day models (parallel)")
     models_90 = Parallel(n_jobs=-1, prefer="threads")(
         delayed(_fit)(X_tr, Y_tr[:, d], 150, 4, 10, 0.2)
@@ -145,7 +144,6 @@ def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
     )
     progress_cb(78, "90-day models complete")
 
-    # ── Evaluate on test set ────────────────────────────────────────────────
     progress_cb(80, "Evaluating on held-out data")
     pred_30_te = np.column_stack([m.predict(X_te) for m in models_30])
     pred_90_te = np.column_stack([m.predict(X_te) for m in models_90])
@@ -153,7 +151,6 @@ def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
     mae_30 = mean_absolute_error(Y_te[:, :30].flatten(), pred_30_te.flatten())
     mae_90 = mean_absolute_error(Y_te.flatten(),         pred_90_te.flatten())
 
-    # ── Final forecast from last window ────────────────────────────────────
     progress_cb(85, "Generating forecast")
     last_w = feat_sc[-LOOKBACK:].flatten().reshape(1, -1)
 
@@ -169,7 +166,6 @@ def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
         for i, v in enumerate(fut_90)
     ]
 
-    # ── Aggregate results ───────────────────────────────────────────────────
     progress_cb(92, "Aggregating results")
     p30   = forecast[:30]
     p90   = forecast[:90]
@@ -244,12 +240,10 @@ def get_risk_factors(context: dict) -> list[str]:
     except Exception:
         return ["macroeconomic_uncertainty"]
 
-# ─── SSE HELPERS ─────────────────────────────────────────────────────────────
-
 def sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
-# ─── ENDPOINT ─────────────────────────────────────────────────────────────────
+# ─── YOUR ORIGINAL FORECAST ENDPOINT ──────────────────────────────────────────
 
 @app.post("/api/v1/forecast-recommendations")
 async def generate_recommendations(payload: List[SalesItem]):
@@ -268,7 +262,6 @@ async def generate_recommendations(payload: List[SalesItem]):
             422, f"Need at least {min_rows} days of history. Got {len(daily_df)}."
         )
 
-    # get_running_loop() — correct for Python 3.10+, unlike get_event_loop()
     loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
     queue: asyncio.Queue            = asyncio.Queue()
 
@@ -283,7 +276,6 @@ async def generate_recommendations(payload: List[SalesItem]):
             loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
 
     async def event_stream():
-        # Immediately emit a heartbeat so the browser knows the connection is alive
         yield sse({"type": "progress", "pct": 1, "message": "Connecting to forecast engine…"})
 
         loop.run_in_executor(executor, run)
@@ -318,6 +310,291 @@ async def generate_recommendations(payload: List[SalesItem]):
 async def health():
     return {"status": "ok"}
 
+
+# ==============================================================================
+# 2. NEW FUSE BUSINESS ADVISOR CHAT (Appended safely)
+# ==============================================================================
+
+fuse_client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
+embedder = None
+db_engine = None
+
+@app.on_event("startup")
+def on_startup():
+    global embedder, db_engine
+    print("[FUSE] Initializing embedding model...")
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    print("[FUSE] Model loaded.")
+    
+    if DATABASE_URL:
+        db_engine = create_engine(DATABASE_URL)
+        print("[FUSE] Database engine initialized.")
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    businessId: str
+    message: str
+    history: List[ChatMessage] = []
+
+@dataclass
+class VectorChunk:
+    id: str
+    document: str
+    embedding: np.ndarray
+
+@dataclass
+class FuseState:
+    rows: List[Dict[str, Any]]
+    chunks: List[VectorChunk]
+    data_summary: str
+    yearly_stats: List[Dict[str, Any]]
+
+_cache: Dict[str, FuseState] = {}
+_inflight: Dict[str, asyncio.Task] = {}
+
+def load_data_from_db(business_id: str) -> List[Dict[str, Any]]:
+    if not db_engine:
+        raise Exception("DATABASE_URL is not set.")
+
+    query = text("""
+        SELECT 
+            o."createdAt" as order_date, 
+            oi."productId" as product_id, 
+            p."name" as product_name, 
+            oi."unitPrice" as unit_price, 
+            oi."quantity" as quantity, 
+            oi."itemDiscount" as item_discount, 
+            p."cost" as cost
+        FROM "order" o
+        INNER JOIN "orderItem" oi ON o.id = oi."orderId"
+        INNER JOIN "product" p ON p.id = oi."productId"
+        WHERE o."businessId" = :biz_id 
+          AND o."status" NOT IN ('cancelled', 'refunded')
+    """)
+
+    with db_engine.connect() as conn:
+        df = pd.read_sql(query, conn, params={"biz_id": business_id})
+
+    if df.empty:
+        return []
+
+    df = df.dropna(subset=['order_date', 'product_id', 'unit_price'])
+    df['price'] = df['unit_price'].astype(float).fillna(0)
+    df['quantity'] = df['quantity'].astype(float).fillna(1)
+    df['discount'] = df['item_discount'].astype(float).fillna(0)
+    df['cost'] = df['cost'].astype(float).fillna(0)
+    
+    df['revenue'] = (df['price'] - df['discount']) * df['quantity']
+    df['profit'] = df['revenue'] - (df['cost'] * df['quantity'])
+    df['profit_margin'] = np.where(df['revenue'] > 0, df['profit'] / df['revenue'], 0)
+    
+    df['order_date'] = pd.to_datetime(df['order_date'])
+    df['year'] = df['order_date'].dt.year
+    df['month'] = df['order_date'].dt.strftime('%Y-%m')
+
+    return df.to_dict('records')
+
+def build_aggregate_documents(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    df = pd.DataFrame(rows)
+    docs = []
+    if df.empty: return docs
+
+    monthly = df.groupby('month').agg(
+        rev=('revenue', 'sum'), prof=('profit', 'sum'), orders=('revenue', 'count'),
+        marg=('profit_margin', 'mean'), qty=('quantity', 'sum')
+    ).reset_index()
+    for _, r in monthly.iterrows():
+        docs.append({"id": f"monthly_{r['month']}", "doc": 
+            f"Month {r['month']}: Revenue={r['rev']:,.0f} EGP, Profit={r['prof']:,.0f} EGP, "
+            f"Orders={r['orders']}, Margin={r['marg']:.1%}, Units Sold={r['qty']:,.0f}"})
+
+    prod = df.groupby(['product_id', 'product_name']).agg(
+        rev=('revenue', 'sum'), prof=('profit', 'sum'), orders=('revenue', 'count'),
+        marg=('profit_margin', 'mean'), qty=('quantity', 'sum'), price=('price', 'mean')
+    ).reset_index()
+    for _, r in prod.iterrows():
+        docs.append({"id": f"product_{r['product_id']}", "doc": 
+            f"Product '{r['product_name']}': Total Revenue={r['rev']:,.0f} EGP, "
+            f"Total Profit={r['prof']:,.0f} EGP, Orders={r['orders']}, Avg Margin={r['marg']:.1%}, "
+            f"Units Sold={r['qty']:,.0f}, Avg Price={r['price']:,.0f} EGP"})
+
+    yearly = df.groupby('year').agg(
+        rev=('revenue', 'sum'), prof=('profit', 'sum'), orders=('revenue', 'count'),
+        marg=('profit_margin', 'mean'), qty=('quantity', 'sum')
+    ).reset_index()
+    for _, r in yearly.iterrows():
+        docs.append({"id": f"year_{r['year']}", "doc": 
+            f"Year {r['year']}: Revenue={r['rev']:,.0f} EGP, Profit={r['prof']:,.0f} EGP, "
+            f"Orders={r['orders']}, Avg Margin={r['marg']:.1%}, Units Sold={r['qty']:,.0f}"})
+
+    return docs
+
+def build_vector_chunks(rows: List[Dict[str, Any]]) -> List[VectorChunk]:
+    docs = build_aggregate_documents(rows)
+    if not docs: return []
+    texts = [d["doc"] for d in docs]
+    embeddings = embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+    return [VectorChunk(id=docs[i]["id"], document=docs[i]["doc"], embedding=embeddings[i]) for i in range(len(docs))]
+
+def cosine_sim(query_emb: np.ndarray, doc_emb: np.ndarray) -> float:
+    return float(np.dot(query_emb, doc_emb))
+
+def query_chunks(query: str, chunks: List[VectorChunk], top_k: int = 12) -> List[str]:
+    if not chunks: return []
+    query_emb = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
+    scored = [(c.document, cosine_sim(query_emb, c.embedding)) for c in chunks]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [doc for doc, score in scored[:top_k]]
+
+def build_data_summary(rows: List[Dict[str, Any]]) -> str:
+    if not rows: return "No order data available for this business yet."
+    df = pd.DataFrame(rows)
+    
+    yearly = df.groupby("year").agg(
+        rev=("revenue", "sum"), prof=("profit", "sum"), 
+        orders=("revenue", "count"), marg=("profit_margin", "mean")
+    ).reset_index().sort_values("year")
+    yearly["rev_growth"] = yearly["rev"].pct_change() * 100
+    
+    yearly_str = ""
+    for _, r in yearly.iterrows():
+        g = f" (YoY: {r['rev_growth']:+.1f}%)" if pd.notna(r["rev_growth"]) else " (base year)"
+        yearly_str += f"  {int(r['year'])}: Revenue={r['rev']:>14,.0f} EGP | Profit={r['prof']:>12,.0f} EGP | Margin={r['marg']:.1%} | Orders={r['orders']}{g}\n"
+
+    monthly_trend = df.groupby("month")["revenue"].sum().sort_index().tail(12)
+    monthly_str = "\n".join(f"  {m}: {v:,.0f} EGP" for m, v in monthly_trend.items())
+
+    p_rev = df.groupby("product_name")["revenue"].sum().nlargest(5)
+    p_pro = df.groupby("product_name")["profit"].sum().nlargest(5)
+    p_mar = df.groupby("product_name")["profit_margin"].mean().nlargest(5)
+
+    return f"""
+════════════════════════════════════════════════
+FUSE BUSINESS INTELLIGENCE
+════════════════════════════════════════════════
+▸ PORTFOLIO SNAPSHOT
+  Total Orders  : {len(df):,}
+  Total Revenue : {df['revenue'].sum():,.0f} EGP
+  Total Profit  : {df['profit'].sum():,.0f} EGP
+  Avg Order Size: {df['price'].mean():,.0f} EGP
+  Avg Margin    : {df['profit_margin'].mean():.1%}
+
+▸ YEAR-ON-YEAR PERFORMANCE
+{yearly_str}
+▸ LAST 12 MONTHS — MONTHLY REVENUE
+{monthly_str}
+
+▸ TOP PRODUCTS — REVENUE
+{chr(10).join(f"  {k}: {v:,.0f} EGP" for k, v in p_rev.items())}
+
+▸ TOP PRODUCTS — PROFIT
+{chr(10).join(f"  {k}: {v:,.0f} EGP" for k, v in p_pro.items())}
+
+▸ TOP PRODUCTS — MARGIN
+{chr(10).join(f"  {k}: {v:.1%}" for k, v in p_mar.items())}
+════════════════════════════════════════════════
+"""
+
+async def _init_fuse_sync(business_id: str) -> FuseState:
+    loop = asyncio.get_running_loop()
+    rows = await loop.run_in_executor(None, load_data_from_db, business_id)
+    data_summary = await loop.run_in_executor(None, build_data_summary, rows)
+    
+    yearly_stats = []
+    if rows:
+        df = pd.DataFrame(rows)
+        y_df = df.groupby("year").agg(rev=("revenue", "sum"), prof=("profit", "sum"), marg=("profit_margin", "mean")).reset_index()
+        y_df["growth"] = y_df["rev"].pct_change() * 100
+        for _, r in y_df.iterrows():
+            yearly_stats.append({
+                "year": int(r['year']), "revenue": r['rev'], "profit": r['prof'], 
+                "margin": r['marg'], "growth": r['growth'] if pd.notna(r['growth']) else None
+            })
+
+    chunks = await loop.run_in_executor(None, build_vector_chunks, rows)
+    return FuseState(rows=rows, chunks=chunks, data_summary=data_summary, yearly_stats=yearly_stats)
+
+async def init_fuse(business_id: str) -> FuseState:
+    if business_id in _cache: return _cache[business_id]
+    if business_id in _inflight: return await _inflight[business_id]
+        
+    task = asyncio.create_task(_init_fuse_sync(business_id))
+    _inflight[business_id] = task
+    try:
+        state = await task
+        _cache[business_id] = state
+        return state
+    finally:
+        _inflight.pop(business_id, None)
+
+@app.post("/api/v1/chat")
+async def chat_with_fuse(req: ChatRequest):
+    if not req.message or not req.businessId:
+        raise HTTPException(status_code=400, detail="businessId and message are required.")
+
+    try:
+        state = await init_fuse(req.businessId)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database fetch failed: {str(e)}")
+
+    retrieved_docs = query_chunks(req.message, state.chunks, top_k=12)
+    
+    yearly_anchor_parts = []
+    for r in state.yearly_stats:
+        growth_str = f"{r['growth']:+.1f}%" if r['growth'] is not None else "N/A"
+        yearly_anchor_parts.append(
+            f"Year {r['year']}: Revenue={r['revenue']:,.0f} EGP, Profit={r['profit']:,.0f} EGP, "
+            f"Margin={r['margin']:.1%}, YoY Growth={growth_str}"
+        )
+    context = f"[Yearly Anchors]\n{chr(10).join(yearly_anchor_parts)}\n\n[Retrieved Context]\n{chr(10).join(retrieved_docs)}"
+
+    system_prompt = f"""
+You are FUSE AI — a senior business advisor embedded inside this company.
+You have an MBA-level grasp of strategy, finance, pricing, operations, and growth.
+
+════════════════════════════════════════════════
+BUSINESS INTELLIGENCE
+════════════════════════════════════════════════
+{state.data_summary}
+════════════════════════════════════════════════
+
+━━━ THE CONSULTANT STANDARD ━━━
+1. ANCHOR IN DATA FIRST. Open with the most relevant hard number.
+2. DIAGNOSE WHAT THE DATA IS TELLING YOU. 
+3. APPLY BUSINESS EXPERTISE. Layer in the "so what".
+4. FOR FUTURE QUESTIONS: Extrapolate from the trend.
+5. CLOSE WITH ONE SHARP ACTION.
+"""
+
+    formatted_history = [{"role": m.role, "content": m.content} for m in req.history]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        *formatted_history,
+        {"role": "user", "content": f"Question: {req.message}\n\nRelevant Context:\n{context}"}
+    ]
+
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(None, lambda: fuse_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.15,
+            max_tokens=1024
+        ))
+        
+        reply = response.choices[0].message.content
+        return {"reply": reply}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM generation failed: {str(e)}")
+
+@app.post("/api/v1/cache/clear")
+def clear_cache(businessId: str):
+    _cache.pop(businessId, None)
+    return {"status": "cleared", "businessId": businessId}
 
 if __name__ == "__main__":
     import uvicorn
