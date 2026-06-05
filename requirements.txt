@@ -14,5 +14,3 @@ openai
 openpyxl
 sqlalchemy
 psycopg2-binary
-logging 
-traceback
