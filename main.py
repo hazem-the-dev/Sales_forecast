@@ -5,7 +5,7 @@ import random
 import asyncio
 import warnings
 from datetime import timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
@@ -23,9 +23,7 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import RobustScaler
 
-# ─── NEW IMPORTS FOR CHAT ROUTE ───────────────────────────────────────────────
 from sqlalchemy import create_engine, text
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 import logging
 import traceback
@@ -45,7 +43,7 @@ os.environ["PYTHONHASHSEED"] = str(SEED)
 
 load_dotenv()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "") # Added for Chat DB connection
+DATABASE_URL  = os.environ.get("DATABASE_URL", "")
 
 app = FastAPI(title="Sales Forecasting & FUSE Chat API")
 app.add_middleware(
@@ -59,20 +57,15 @@ app.add_middleware(
 executor = ThreadPoolExecutor(max_workers=4)
 
 # ==============================================================================
-# 1. YOUR EXACT ORIGINAL FORECASTING PIPELINE & ROUTE
+# 1. ORIGINAL FORECASTING PIPELINE (unchanged)
 # ==============================================================================
-
-# ─── SCHEMA ───────────────────────────────────────────────────────────────────
 
 class SalesItem(BaseModel):
     order_date: str = Field(..., description="YYYY-MM-DD")
     revenue: float
 
-# ─── FEATURE ENGINEERING ──────────────────────────────────────────────────────
-
 def build_features(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy().resample("D").sum().fillna(0)
-
     df["dow"]        = df.index.dayofweek
     df["dom"]        = df.index.day
     df["month"]      = df.index.month
@@ -82,23 +75,17 @@ def build_features(raw: pd.DataFrame) -> pd.DataFrame:
     df["month_cos"]  = np.cos(2 * np.pi * df["month"] / 12)
     df["dow_sin"]    = np.sin(2 * np.pi * df["dow"] / 7)
     df["dow_cos"]    = np.cos(2 * np.pi * df["dow"] / 7)
-
     for lag in [1, 7, 14, 30]:
         df[f"lag_{lag}"]   = df["revenue"].shift(lag)
         df[f"trend_{lag}"] = df["revenue"] - df[f"lag_{lag}"]
-
     for w in [7, 14, 30]:
         df[f"rmean_{w}"] = df["revenue"].rolling(w).mean()
         df[f"rstd_{w}"]  = df["revenue"].rolling(w).std().fillna(0)
         df[f"rmin_{w}"]  = df["revenue"].rolling(w).min()
         df[f"rmax_{w}"]  = df["revenue"].rolling(w).max()
-
     df["pct_change"] = df["revenue"].pct_change().replace([np.inf, -np.inf], 0).fillna(0)
     df["is_zero"]    = (df["revenue"] == 0).astype(int)
-
     return df.dropna()
-
-# ─── MULTI-STEP DATASET ───────────────────────────────────────────────────────
 
 def make_dataset(rev: np.ndarray, feats: np.ndarray):
     X, Y = [], []
@@ -107,23 +94,18 @@ def make_dataset(rev: np.ndarray, feats: np.ndarray):
         Y.append(rev[i : i + HORIZON])
     return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
 
-# ─── PIPELINE ────────────────────────────────────────────────────────────────
-
 def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
     feat_cols = [c for c in daily_df.columns if c != "revenue"]
     feat_arr  = daily_df[feat_cols].values.astype(np.float32)
     rev_arr   = daily_df["revenue"].values.astype(np.float32)
-
     progress_cb(5, "Scaling features")
     scaler  = RobustScaler()
     feat_sc = scaler.fit_transform(feat_arr).astype(np.float32)
-
     progress_cb(10, "Building training windows")
     X, Y = make_dataset(rev_arr, feat_sc)
     split    = max(2, int(len(X) * 0.8))
     X_tr, X_te = X[:split], X[split:]
     Y_tr, Y_te = Y[:split], Y[split:]
-
     def _fit(X, y, max_iter, max_depth, min_leaf, l2):
         m = HistGradientBoostingRegressor(
             max_iter=max_iter, max_depth=max_depth, learning_rate=0.1,
@@ -133,56 +115,43 @@ def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
         )
         m.fit(X, y)
         return m
-
     progress_cb(15, "Training 30-day models (parallel)")
     models_30 = Parallel(n_jobs=-1, prefer="threads")(
-        delayed(_fit)(X_tr, Y_tr[:, d], 200, 5, 8, 0.1)
-        for d in range(30)
+        delayed(_fit)(X_tr, Y_tr[:, d], 200, 5, 8, 0.1) for d in range(30)
     )
     progress_cb(48, "30-day models complete")
-
     progress_cb(50, "Training 90-day models (parallel)")
     models_90 = Parallel(n_jobs=-1, prefer="threads")(
-        delayed(_fit)(X_tr, Y_tr[:, d], 150, 4, 10, 0.2)
-        for d in range(HORIZON)
+        delayed(_fit)(X_tr, Y_tr[:, d], 150, 4, 10, 0.2) for d in range(HORIZON)
     )
     progress_cb(78, "90-day models complete")
-
     progress_cb(80, "Evaluating on held-out data")
     pred_30_te = np.column_stack([m.predict(X_te) for m in models_30])
     pred_90_te = np.column_stack([m.predict(X_te) for m in models_90])
-
     mae_30 = mean_absolute_error(Y_te[:, :30].flatten(), pred_30_te.flatten())
     mae_90 = mean_absolute_error(Y_te.flatten(),         pred_90_te.flatten())
-
     progress_cb(85, "Generating forecast")
     last_w = feat_sc[-LOOKBACK:].flatten().reshape(1, -1)
-
     fut_30 = np.array([m.predict(last_w)[0] for m in models_30])
     fut_90 = np.array([m.predict(last_w)[0] for m in models_90])
-    fut_90[:30] = 0.5 * fut_30 + 0.5 * fut_90[:30]   # blend short-horizon
+    fut_90[:30] = 0.5 * fut_30 + 0.5 * fut_90[:30]
     fut_90 = np.maximum(0.0, fut_90)
-
     last_date = daily_df.index.max()
     forecast  = [
-        {"date": str((last_date + timedelta(days=i + 1)).date()),
-         "predicted_sales": float(v)}
+        {"date": str((last_date + timedelta(days=i + 1)).date()), "predicted_sales": float(v)}
         for i, v in enumerate(fut_90)
     ]
-
     progress_cb(92, "Aggregating results")
     p30   = forecast[:30]
     p90   = forecast[:90]
     rev30 = sum(p["predicted_sales"] for p in p30)
     rev90 = sum(p["predicted_sales"] for p in p90)
-
     peak_days = [
         p["date"]
         for p in sorted(p90, key=lambda x: x["predicted_sales"], reverse=True)[:3]
     ]
     hist_90    = float(daily_df["revenue"].iloc[-90:].sum())
     growth_yoy = round((rev90 - hist_90) / hist_90, 2) if hist_90 > 0 else 0.0
-
     progress_cb(95, "Fetching risk analysis")
     risk_factors = get_risk_factors({
         "projected_30_revenue":   rev30,
@@ -190,7 +159,6 @@ def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
         "peak_days_identified":   peak_days,
         "calculated_growth_rate": growth_yoy,
     })
-
     progress_cb(99, "Finalising")
     return {
         "next_30_days": {
@@ -208,8 +176,6 @@ def run_pipeline(daily_df: pd.DataFrame, progress_cb) -> dict:
         "growth_rate_yoy": growth_yoy,
     }
 
-# ─── LLM RISK FACTORS ────────────────────────────────────────────────────────
-
 _RISK_PROMPT = (
     "You are a senior revenue analyst. Given the JSON payload about future sales "
     "trajectory, return ONLY a valid JSON array of contextual risk factor slugs "
@@ -221,8 +187,7 @@ def get_risk_factors(context: dict) -> list[str]:
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                     "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
                 "model": "llama-3.3-70b-versatile",
                 "messages": [
@@ -247,67 +212,47 @@ def get_risk_factors(context: dict) -> list[str]:
 def sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
-# ─── YOUR ORIGINAL FORECAST ENDPOINT ──────────────────────────────────────────
-
 @app.post("/api/v1/forecast-recommendations")
 async def generate_recommendations(payload: List[SalesItem]):
     df = pd.DataFrame([i.dict() for i in payload])
     if df.empty or "order_date" not in df.columns or "revenue" not in df.columns:
         raise HTTPException(400, "Missing required fields: order_date, revenue")
-
     df["order_date"] = pd.to_datetime(df["order_date"])
     df = df.sort_values("order_date").reset_index(drop=True)
     raw_sales = df.groupby("order_date")["revenue"].sum().to_frame()
-
     daily_df = build_features(raw_sales)
     min_rows = LOOKBACK + HORIZON + 10
     if len(daily_df) < min_rows:
-        raise HTTPException(
-            422, f"Need at least {min_rows} days of history. Got {len(daily_df)}."
-        )
-
+        raise HTTPException(422, f"Need at least {min_rows} days of history. Got {len(daily_df)}.")
     loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
     queue: asyncio.Queue            = asyncio.Queue()
-
     def progress_cb(pct: int, message: str) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, ("progress", pct, message))
-
     def run() -> None:
         try:
             result = run_pipeline(daily_df, progress_cb)
             loop.call_soon_threadsafe(queue.put_nowait, ("result", result))
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
-
     async def event_stream():
         yield sse({"type": "progress", "pct": 1, "message": "Connecting to forecast engine…"})
-
         loop.run_in_executor(executor, run)
-
         while True:
             item = await asyncio.wait_for(queue.get(), timeout=300)
             kind = item[0]
-
             if kind == "progress":
                 yield sse({"type": "progress", "pct": item[1], "message": item[2]})
-
             elif kind == "result":
                 yield sse({"type": "progress", "pct": 100, "message": "Complete"})
                 yield sse({"type": "result",   "data": item[1]})
                 break
-
             elif kind == "error":
                 yield sse({"type": "error", "message": item[1]})
                 break
-
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control":      "no-cache",
-            "X-Accel-Buffering":  "no",
-            "Connection":         "keep-alive",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
 @app.get("/health")
@@ -316,20 +261,15 @@ async def health():
 
 
 # ==============================================================================
-# 2. NEW FUSE BUSINESS ADVISOR CHAT (Appended safely)
+# 2. FUSE BUSINESS ADVISOR CHAT — Tool-calling approach (no bulk data load)
 # ==============================================================================
 
 fuse_client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
-embedder = None
 db_engine = None
 
 @app.on_event("startup")
 def on_startup():
-    global embedder, db_engine
-    print("[FUSE] Initializing embedding model...")
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    print("[FUSE] Model loaded.")
-    
+    global db_engine
     if DATABASE_URL:
         db_engine = create_engine(DATABASE_URL)
         print("[FUSE] Database engine initialized.")
@@ -343,275 +283,448 @@ class ChatRequest(BaseModel):
     message: str
     history: List[ChatMessage] = []
 
-@dataclass
-class VectorChunk:
-    id: str
-    document: str
-    embedding: np.ndarray
 
-@dataclass
-class FuseState:
-    rows: List[Dict[str, Any]]
-    chunks: List[VectorChunk]
-    data_summary: str
-    yearly_stats: List[Dict[str, Any]]
+# ─── TOOL DEFINITIONS (sent to the LLM) ───────────────────────────────────────
 
-_cache: Dict[str, FuseState] = {}
-_inflight: Dict[str, asyncio.Task] = {}
+CHAT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_revenue_summary",
+            "description": (
+                "Returns total revenue, profit, order count, and average margin "
+                "grouped by year and month. Use this for general performance questions, "
+                "trends, or year-on-year comparisons."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_product_performance",
+            "description": (
+                "Returns revenue, profit, units sold, and margin for each product. "
+                "Use this for product-level questions: best sellers, worst performers, "
+                "margin leaders, pricing analysis."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many products to return (default 20, max 100).",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_monthly_trend",
+            "description": (
+                "Returns month-by-month revenue and order count for a specific year, "
+                "or the last N months. Use for seasonality, monthly deep-dives, or "
+                "recent trend questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "year": {
+                        "type": "integer",
+                        "description": "Filter to a specific year (e.g. 2024). Omit for last 12 months.",
+                    },
+                    "last_n_months": {
+                        "type": "integer",
+                        "description": "Return the last N months of data (default 12).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_top_products",
+            "description": (
+                "Returns the top N products ranked by a chosen metric: revenue, profit, "
+                "margin, or units_sold. Use for 'best product' or ranking questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metric": {
+                        "type": "string",
+                        "enum": ["revenue", "profit", "margin", "units_sold"],
+                        "description": "The metric to rank by.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many top products to return (default 5).",
+                    },
+                },
+                "required": ["metric"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_recent_orders_summary",
+            "description": (
+                "Returns a summary of orders in the last N days: total revenue, order count, "
+                "average order value. Use for 'recently', 'this week', 'last 30 days' questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Number of recent days to summarise (default 30).",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+]
 
-def load_data_from_db(business_id: str) -> List[Dict[str, Any]]:
+
+# ─── TOOL EXECUTOR ────────────────────────────────────────────────────────────
+
+def execute_tool(tool_name: str, args: dict, business_id: str) -> str:
+    """Run the requested SQL tool and return a plain-text result string."""
     if not db_engine:
-        raise Exception("DATABASE_URL is not set.")
+        return "Database not available."
 
-    query = text("""
-        SELECT 
-            o.created_at as order_date,
-            oi.product_id,
-            p.name as product_name,
-            oi.unit_price,
-            oi.quantity,
-            oi.item_discount,
-            p.cost
-        FROM "order" o
-        INNER JOIN order_item oi ON o.id = oi.order_id
-        INNER JOIN product p ON p.id = oi.product_id
-        WHERE o.business_id = :biz_id
-        AND o.status NOT IN ('cancelled', 'refunded')
-    """)
-
-    with db_engine.connect() as conn:
-        df = pd.read_sql(query, conn, params={"biz_id": business_id})
-
-    if df.empty:
-        return []
-
-    df = df.dropna(subset=['order_date', 'product_id', 'unit_price'])
-    df['price'] = df['unit_price'].astype(float).fillna(0)
-    df['quantity'] = df['quantity'].astype(float).fillna(1)
-    df['discount'] = df['item_discount'].astype(float).fillna(0)
-    df['cost'] = df['cost'].astype(float).fillna(0)
-    
-    df['revenue'] = (df['price'] - df['discount']) * df['quantity']
-    df['profit'] = df['revenue'] - (df['cost'] * df['quantity'])
-    df['profit_margin'] = np.where(df['revenue'] > 0, df['profit'] / df['revenue'], 0)
-    
-    df['order_date'] = pd.to_datetime(df['order_date'])
-    df['year'] = df['order_date'].dt.year
-    df['month'] = df['order_date'].dt.strftime('%Y-%m')
-
-    return df.to_dict('records')
-
-def build_aggregate_documents(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    df = pd.DataFrame(rows)
-    docs = []
-    if df.empty: return docs
-
-    monthly = df.groupby('month').agg(
-        rev=('revenue', 'sum'), prof=('profit', 'sum'), orders=('revenue', 'count'),
-        marg=('profit_margin', 'mean'), qty=('quantity', 'sum')
-    ).reset_index()
-    for _, r in monthly.iterrows():
-        docs.append({"id": f"monthly_{r['month']}", "doc": 
-            f"Month {r['month']}: Revenue={r['rev']:,.0f} EGP, Profit={r['prof']:,.0f} EGP, "
-            f"Orders={r['orders']}, Margin={r['marg']:.1%}, Units Sold={r['qty']:,.0f}"})
-
-    prod = df.groupby(['product_id', 'product_name']).agg(
-        rev=('revenue', 'sum'), prof=('profit', 'sum'), orders=('revenue', 'count'),
-        marg=('profit_margin', 'mean'), qty=('quantity', 'sum'), price=('price', 'mean')
-    ).reset_index()
-    for _, r in prod.iterrows():
-        docs.append({"id": f"product_{r['product_id']}", "doc": 
-            f"Product '{r['product_name']}': Total Revenue={r['rev']:,.0f} EGP, "
-            f"Total Profit={r['prof']:,.0f} EGP, Orders={r['orders']}, Avg Margin={r['marg']:.1%}, "
-            f"Units Sold={r['qty']:,.0f}, Avg Price={r['price']:,.0f} EGP"})
-
-    yearly = df.groupby('year').agg(
-        rev=('revenue', 'sum'), prof=('profit', 'sum'), orders=('revenue', 'count'),
-        marg=('profit_margin', 'mean'), qty=('quantity', 'sum')
-    ).reset_index()
-    for _, r in yearly.iterrows():
-        docs.append({"id": f"year_{r['year']}", "doc": 
-            f"Year {r['year']}: Revenue={r['rev']:,.0f} EGP, Profit={r['prof']:,.0f} EGP, "
-            f"Orders={r['orders']}, Avg Margin={r['marg']:.1%}, Units Sold={r['qty']:,.0f}"})
-
-    return docs
-
-def build_vector_chunks(rows: List[Dict[str, Any]]) -> List[VectorChunk]:
-    docs = build_aggregate_documents(rows)
-    if not docs: return []
-    texts = [d["doc"] for d in docs]
-    embeddings = embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-    return [VectorChunk(id=docs[i]["id"], document=docs[i]["doc"], embedding=embeddings[i]) for i in range(len(docs))]
-
-def cosine_sim(query_emb: np.ndarray, doc_emb: np.ndarray) -> float:
-    return float(np.dot(query_emb, doc_emb))
-
-def query_chunks(query: str, chunks: List[VectorChunk], top_k: int = 12) -> List[str]:
-    if not chunks: return []
-    query_emb = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
-    scored = [(c.document, cosine_sim(query_emb, c.embedding)) for c in chunks]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [doc for doc, score in scored[:top_k]]
-
-def build_data_summary(rows: List[Dict[str, Any]]) -> str:
-    if not rows: return "No order data available for this business yet."
-    df = pd.DataFrame(rows)
-    
-    yearly = df.groupby("year").agg(
-        rev=("revenue", "sum"), prof=("profit", "sum"), 
-        orders=("revenue", "count"), marg=("profit_margin", "mean")
-    ).reset_index().sort_values("year")
-    yearly["rev_growth"] = yearly["rev"].pct_change() * 100
-    
-    yearly_str = ""
-    for _, r in yearly.iterrows():
-        g = f" (YoY: {r['rev_growth']:+.1f}%)" if pd.notna(r["rev_growth"]) else " (base year)"
-        yearly_str += f"  {int(r['year'])}: Revenue={r['rev']:>14,.0f} EGP | Profit={r['prof']:>12,.0f} EGP | Margin={r['marg']:.1%} | Orders={r['orders']}{g}\n"
-
-    monthly_trend = df.groupby("month")["revenue"].sum().sort_index().tail(12)
-    monthly_str = "\n".join(f"  {m}: {v:,.0f} EGP" for m, v in monthly_trend.items())
-
-    p_rev = df.groupby("product_name")["revenue"].sum().nlargest(5)
-    p_pro = df.groupby("product_name")["profit"].sum().nlargest(5)
-    p_mar = df.groupby("product_name")["profit_margin"].mean().nlargest(5)
-
-    return f"""
-════════════════════════════════════════════════
-FUSE BUSINESS INTELLIGENCE
-════════════════════════════════════════════════
-▸ PORTFOLIO SNAPSHOT
-  Total Orders  : {len(df):,}
-  Total Revenue : {df['revenue'].sum():,.0f} EGP
-  Total Profit  : {df['profit'].sum():,.0f} EGP
-  Avg Order Size: {df['price'].mean():,.0f} EGP
-  Avg Margin    : {df['profit_margin'].mean():.1%}
-
-▸ YEAR-ON-YEAR PERFORMANCE
-{yearly_str}
-▸ LAST 12 MONTHS — MONTHLY REVENUE
-{monthly_str}
-
-▸ TOP PRODUCTS — REVENUE
-{chr(10).join(f"  {k}: {v:,.0f} EGP" for k, v in p_rev.items())}
-
-▸ TOP PRODUCTS — PROFIT
-{chr(10).join(f"  {k}: {v:,.0f} EGP" for k, v in p_pro.items())}
-
-▸ TOP PRODUCTS — MARGIN
-{chr(10).join(f"  {k}: {v:.1%}" for k, v in p_mar.items())}
-════════════════════════════════════════════════
-"""
-
-async def _init_fuse_sync(business_id: str) -> FuseState:
-    loop = asyncio.get_running_loop()
-    rows = await loop.run_in_executor(None, load_data_from_db, business_id)
-    data_summary = await loop.run_in_executor(None, build_data_summary, rows)
-    
-    yearly_stats = []
-    if rows:
-        df = pd.DataFrame(rows)
-        y_df = df.groupby("year").agg(rev=("revenue", "sum"), prof=("profit", "sum"), marg=("profit_margin", "mean")).reset_index()
-        y_df["growth"] = y_df["rev"].pct_change() * 100
-        for _, r in y_df.iterrows():
-            yearly_stats.append({
-                "year": int(r['year']), "revenue": r['rev'], "profit": r['prof'], 
-                "margin": r['marg'], "growth": r['growth'] if pd.notna(r['growth']) else None
-            })
-
-    chunks = await loop.run_in_executor(None, build_vector_chunks, rows)
-    return FuseState(rows=rows, chunks=chunks, data_summary=data_summary, yearly_stats=yearly_stats)
-
-async def init_fuse(business_id: str) -> FuseState:
-    if business_id in _cache: return _cache[business_id]
-    if business_id in _inflight: return await _inflight[business_id]
-        
-    task = asyncio.create_task(_init_fuse_sync(business_id))
-    _inflight[business_id] = task
     try:
-        state = await task
-        _cache[business_id] = state
-        return state
-    finally:
-        _inflight.pop(business_id, None)
+        with db_engine.connect() as conn:
+
+            # Base subquery reused across all tools
+            base = """
+                SELECT
+                    o.created_at                                    AS order_date,
+                    oi.product_id,
+                    p.name                                          AS product_name,
+                    oi.unit_price,
+                    oi.quantity,
+                    COALESCE(oi.item_discount, 0)                   AS item_discount,
+                    COALESCE(p.cost, 0)                             AS cost
+                FROM "order" o
+                JOIN order_item oi ON o.id = oi.order_id
+                JOIN product    p  ON p.id = oi.product_id
+                WHERE o.business_id = :biz_id
+                  AND o.status NOT IN ('cancelled', 'refunded')
+            """
+
+            if tool_name == "get_revenue_summary":
+                q = text(f"""
+                    WITH base AS ({base})
+                    SELECT
+                        EXTRACT(YEAR  FROM order_date)::int  AS year,
+                        TO_CHAR(order_date, 'YYYY-MM')       AS month,
+                        COUNT(*)                              AS orders,
+                        SUM((unit_price - item_discount) * quantity)               AS revenue,
+                        SUM(((unit_price - item_discount) - cost) * quantity)      AS profit
+                    FROM base
+                    GROUP BY 1, 2
+                    ORDER BY 2
+                """)
+                df = pd.read_sql(q, conn, params={"biz_id": business_id})
+                if df.empty:
+                    return "No order data found."
+                df["margin"] = (df["profit"] / df["revenue"].replace(0, np.nan)).fillna(0)
+                yearly = df.groupby("year").agg(
+                    revenue=("revenue","sum"), profit=("profit","sum"),
+                    orders=("orders","sum"), margin=("margin","mean")
+                ).reset_index()
+                yearly["yoy_growth"] = yearly["revenue"].pct_change() * 100
+                lines = ["=== Revenue Summary by Year ==="]
+                for _, r in yearly.iterrows():
+                    g = f" | YoY Growth: {r['yoy_growth']:+.1f}%" if pd.notna(r["yoy_growth"]) else ""
+                    lines.append(
+                        f"  {int(r['year'])}: Revenue={r['revenue']:,.0f} EGP | "
+                        f"Profit={r['profit']:,.0f} EGP | Margin={r['margin']:.1%} | "
+                        f"Orders={int(r['orders'])}{g}"
+                    )
+                lines.append("\n=== Last 12 Months ===")
+                for _, r in df.tail(12).iterrows():
+                    lines.append(f"  {r['month']}: Revenue={r['revenue']:,.0f} EGP | Orders={int(r['orders'])}")
+                return "\n".join(lines)
+
+            elif tool_name == "get_product_performance":
+                limit = min(int(args.get("limit", 20)), 100)
+                q = text(f"""
+                    WITH base AS ({base})
+                    SELECT
+                        product_name,
+                        COUNT(*)                                                   AS orders,
+                        SUM(quantity)                                              AS units_sold,
+                        SUM((unit_price - item_discount) * quantity)               AS revenue,
+                        SUM(((unit_price - item_discount) - cost) * quantity)      AS profit,
+                        AVG(unit_price)                                            AS avg_price
+                    FROM base
+                    GROUP BY product_name
+                    ORDER BY revenue DESC
+                    LIMIT :lim
+                """)
+                df = pd.read_sql(q, conn, params={"biz_id": business_id, "lim": limit})
+                if df.empty:
+                    return "No product data found."
+                df["margin"] = (df["profit"] / df["revenue"].replace(0, np.nan)).fillna(0)
+                lines = [f"=== Product Performance (top {limit} by revenue) ==="]
+                for _, r in df.iterrows():
+                    lines.append(
+                        f"  {r['product_name']}: Revenue={r['revenue']:,.0f} EGP | "
+                        f"Profit={r['profit']:,.0f} EGP | Margin={r['margin']:.1%} | "
+                        f"Units={int(r['units_sold'])} | Avg Price={r['avg_price']:,.0f} EGP"
+                    )
+                return "\n".join(lines)
+
+            elif tool_name == "get_monthly_trend":
+                year = args.get("year")
+                last_n = int(args.get("last_n_months", 12))
+                if year:
+                    q = text(f"""
+                        WITH base AS ({base})
+                        SELECT
+                            TO_CHAR(order_date, 'YYYY-MM') AS month,
+                            COUNT(*)                        AS orders,
+                            SUM((unit_price - item_discount) * quantity) AS revenue
+                        FROM base
+                        WHERE EXTRACT(YEAR FROM order_date) = :yr
+                        GROUP BY 1 ORDER BY 1
+                    """)
+                    df = pd.read_sql(q, conn, params={"biz_id": business_id, "yr": year})
+                else:
+                    q = text(f"""
+                        WITH base AS ({base})
+                        SELECT
+                            TO_CHAR(order_date, 'YYYY-MM') AS month,
+                            COUNT(*)                        AS orders,
+                            SUM((unit_price - item_discount) * quantity) AS revenue
+                        FROM base
+                        GROUP BY 1 ORDER BY 1
+                        LIMIT :n
+                    """)
+                    # get all then tail
+                    q2 = text(f"""
+                        WITH base AS ({base})
+                        SELECT
+                            TO_CHAR(order_date, 'YYYY-MM') AS month,
+                            COUNT(*)                        AS orders,
+                            SUM((unit_price - item_discount) * quantity) AS revenue
+                        FROM base
+                        GROUP BY 1 ORDER BY 1
+                    """)
+                    df = pd.read_sql(q2, conn, params={"biz_id": business_id}).tail(last_n)
+                if df.empty:
+                    return "No monthly data found."
+                lines = [f"=== Monthly Trend ==="]
+                for _, r in df.iterrows():
+                    lines.append(f"  {r['month']}: Revenue={r['revenue']:,.0f} EGP | Orders={int(r['orders'])}")
+                return "\n".join(lines)
+
+            elif tool_name == "get_top_products":
+                metric = args.get("metric", "revenue")
+                limit  = int(args.get("limit", 5))
+                metric_map = {
+                    "revenue":    "SUM((unit_price - item_discount) * quantity)",
+                    "profit":     "SUM(((unit_price - item_discount) - cost) * quantity)",
+                    "units_sold": "SUM(quantity)",
+                    "margin":     "SUM(((unit_price - item_discount) - cost) * quantity) / NULLIF(SUM((unit_price - item_discount) * quantity), 0)",
+                }
+                order_expr = metric_map.get(metric, metric_map["revenue"])
+                q = text(f"""
+                    WITH base AS ({base})
+                    SELECT
+                        product_name,
+                        SUM((unit_price - item_discount) * quantity)               AS revenue,
+                        SUM(((unit_price - item_discount) - cost) * quantity)      AS profit,
+                        SUM(quantity)                                              AS units_sold,
+                        SUM(((unit_price - item_discount) - cost) * quantity)
+                            / NULLIF(SUM((unit_price - item_discount) * quantity), 0) AS margin
+                    FROM base
+                    GROUP BY product_name
+                    ORDER BY {order_expr} DESC
+                    LIMIT :lim
+                """)
+                df = pd.read_sql(q, conn, params={"biz_id": business_id, "lim": limit})
+                if df.empty:
+                    return "No product data found."
+                lines = [f"=== Top {limit} Products by {metric.replace('_',' ').title()} ==="]
+                for i, (_, r) in enumerate(df.iterrows(), 1):
+                    lines.append(
+                        f"  #{i} {r['product_name']}: Revenue={r['revenue']:,.0f} EGP | "
+                        f"Profit={r['profit']:,.0f} EGP | Margin={r['margin']:.1%} | "
+                        f"Units={int(r['units_sold'])}"
+                    )
+                return "\n".join(lines)
+
+            elif tool_name == "get_recent_orders_summary":
+                days = int(args.get("days", 30))
+                q = text(f"""
+                    WITH base AS ({base})
+                    SELECT
+                        COUNT(DISTINCT order_date::date)                           AS active_days,
+                        COUNT(*)                                                   AS total_items,
+                        SUM((unit_price - item_discount) * quantity)               AS revenue,
+                        SUM(((unit_price - item_discount) - cost) * quantity)      AS profit,
+                        AVG((unit_price - item_discount) * quantity)               AS avg_item_value
+                    FROM base
+                    WHERE order_date >= NOW() - INTERVAL ':days days'
+                """)
+                # SQLAlchemy doesn't interpolate inside strings, use explicit cast
+                q2 = text(f"""
+                    WITH base AS (
+                        SELECT
+                            o.created_at                                    AS order_date,
+                            oi.unit_price,
+                            oi.quantity,
+                            COALESCE(oi.item_discount, 0)                   AS item_discount,
+                            COALESCE(p.cost, 0)                             AS cost
+                        FROM "order" o
+                        JOIN order_item oi ON o.id = oi.order_id
+                        JOIN product    p  ON p.id = oi.product_id
+                        WHERE o.business_id = :biz_id
+                          AND o.status NOT IN ('cancelled', 'refunded')
+                          AND o.created_at >= NOW() - CAST(:days_val || ' days' AS INTERVAL)
+                    )
+                    SELECT
+                        COUNT(*)                                                   AS total_items,
+                        SUM((unit_price - item_discount) * quantity)               AS revenue,
+                        SUM(((unit_price - item_discount) - cost) * quantity)      AS profit,
+                        AVG((unit_price - item_discount) * quantity)               AS avg_item_value
+                    FROM base
+                """)
+                df = pd.read_sql(q2, conn, params={"biz_id": business_id, "days_val": str(days)})
+                if df.empty or df["revenue"].iloc[0] is None:
+                    return f"No orders found in the last {days} days."
+                r = df.iloc[0]
+                margin = (r["profit"] / r["revenue"]) if r["revenue"] else 0
+                return (
+                    f"=== Last {days} Days Summary ===\n"
+                    f"  Revenue:         {r['revenue']:,.0f} EGP\n"
+                    f"  Profit:          {r['profit']:,.0f} EGP\n"
+                    f"  Margin:          {margin:.1%}\n"
+                    f"  Items Sold:      {int(r['total_items'])}\n"
+                    f"  Avg Item Value:  {r['avg_item_value']:,.0f} EGP"
+                )
+
+            else:
+                return f"Unknown tool: {tool_name}"
+
+    except Exception as e:
+        traceback.print_exc()
+        return f"Tool error ({tool_name}): {str(e)}"
+
+
+# ─── CHAT ENDPOINT ─────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are FUSE AI — a senior business advisor with MBA-level expertise 
+in strategy, finance, pricing, operations, and growth. You have access to the business's 
+live database through a set of tools. 
+
+IMPORTANT RULES:
+- Always call a tool before answering data-related questions. Never guess numbers.
+- Call only the tool(s) needed to answer the specific question — don't over-fetch.
+- After receiving tool results, give a sharp, insight-driven answer:
+  1. Lead with the key number
+  2. Diagnose what it means
+  3. Give one concrete action
+- Be concise. Avoid filler. Talk like a trusted advisor, not a chatbot."""
+
 
 @app.post("/api/v1/chat")
 async def chat_with_fuse(req: ChatRequest):
     if not req.message or not req.businessId:
         raise HTTPException(status_code=400, detail="businessId and message are required.")
 
-    try:
-        state = await init_fuse(req.businessId)
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Database fetch failed: {str(e)}")
-
-    retrieved_docs = query_chunks(req.message, state.chunks, top_k=12)
-    
-    yearly_anchor_parts = []
-
-    for r in state.yearly_stats or []:
-        growth = r.get("growth")
-        revenue = r.get("revenue", 0)
-        profit = r.get("profit", 0)
-        margin = r.get("margin")
-
-        growth_str = f"{growth:+.1f}%" if isinstance(growth, (int, float)) else "N/A"
-        margin_str = f"{margin:.1%}" if isinstance(margin, (int, float)) else "N/A"
-
-        yearly_anchor_parts.append(
-            f"Year {r.get('year', 'N/A')}: "
-            f"Revenue={revenue:,.0f} EGP, "
-            f"Profit={profit:,.0f} EGP, "
-            f"Margin={margin_str}, "
-            f"YoY Growth={growth_str}"
-        )
-    context = f"[Yearly Anchors]\n{chr(10).join(yearly_anchor_parts)}\n\n[Retrieved Context]\n{chr(10).join(retrieved_docs)}"
-
-    system_prompt = f"""
-        You are FUSE AI — a senior business advisor embedded inside this company.
-        You have an MBA-level grasp of strategy, finance, pricing, operations, and growth.
-
-        ════════════════════════════════════════════════
-        BUSINESS INTELLIGENCE
-        ════════════════════════════════════════════════
-        {state.data_summary}
-        ════════════════════════════════════════════════
-
-        ━━━ THE CONSULTANT STANDARD ━━━
-        1. ANCHOR IN DATA FIRST. Open with the most relevant hard number.
-        2. DIAGNOSE WHAT THE DATA IS TELLING YOU. 
-        3. APPLY BUSINESS EXPERTISE. Layer in the "so what".
-        4. FOR FUTURE QUESTIONS: Extrapolate from the trend.
-        5. CLOSE WITH ONE SHARP ACTION.
-        """
-
     formatted_history = [{"role": m.role, "content": m.content} for m in req.history]
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": SYSTEM_PROMPT},
         *formatted_history,
-        {"role": "user", "content": f"Question: {req.message}\n\nRelevant Context:\n{context}"}
+        {"role": "user", "content": req.message},
     ]
 
-    try:
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, lambda: fuse_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            temperature=0.15,
-            max_tokens=1024
-        ))
-        
-        reply = response.choices[0].message.content
+    loop = asyncio.get_running_loop()
+
+    # ── Agentic tool-call loop (max 3 rounds to stay within timeout) ──────────
+    MAX_ROUNDS = 3
+    for round_num in range(MAX_ROUNDS):
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: fuse_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    tools=CHAT_TOOLS,
+                    tool_choice="auto",
+                    temperature=0.15,
+                    max_tokens=1024,
+                ),
+            )
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"LLM call failed: {str(e)}")
+
+        choice = response.choices[0]
+
+        # ── Model wants to call tools ─────────────────────────────────────────
+        if choice.finish_reason == "tool_calls":
+            tool_calls = choice.message.tool_calls
+
+            # Append assistant message with tool_calls
+            messages.append({
+                "role": "assistant",
+                "content": choice.message.content or "",
+                "tool_calls": [
+                    {
+                        "id":       tc.id,
+                        "type":     "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            # Execute each tool and append results
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                logging.debug(f"[FUSE] Tool call: {tc.function.name}({args})")
+                result_text = await loop.run_in_executor(
+                    None, execute_tool, tc.function.name, args, req.businessId
+                )
+                logging.debug(f"[FUSE] Tool result ({tc.function.name}): {result_text[:200]}")
+
+                messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tc.id,
+                    "content":      result_text,
+                })
+
+            # Loop back → model will now generate a final answer
+            continue
+
+        # ── Model produced a final text answer ───────────────────────────────
+        reply = choice.message.content or "I couldn't generate a response."
         return {"reply": reply}
 
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"LLM generation failed: {str(e)}")
+    # Fallback if we exhausted rounds without a final answer
+    return {"reply": "I reached the maximum number of tool calls. Please try rephrasing your question."}
 
-@app.post("/api/v1/cache/clear")
-def clear_cache(businessId: str):
-    _cache.pop(businessId, None)
-    return {"status": "cleared", "businessId": businessId}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
 
 if __name__ == "__main__":
     import uvicorn
